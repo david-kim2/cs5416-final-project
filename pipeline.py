@@ -6,7 +6,9 @@ import numpy as np
 import torch
 import faiss
 import sqlite3
-from typing import List, Dict, Any
+import requests
+import psutil
+from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from transformers import (
     AutoTokenizer,
@@ -18,15 +20,49 @@ from transformers import pipeline as hf_pipeline
 import warnings
 from sentence_transformers import SentenceTransformer
 from flask import Flask, request, jsonify
-from queue import Queue
+from queue import Queue, Empty
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
-# Read environment variables
-TOTAL_NODES = int(os.environ.get('TOTAL_NODES', 1))
+warnings.filterwarnings('ignore')
+
+# ==================================================================
+# MEMORY MONITORING UTILITIES
+# ==================================================================
+
+def get_memory_usage_mb():
+    """Get current process memory usage in MB"""
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / 1024 / 1024
+
+def get_memory_stats():
+    """Get detailed memory statistics"""
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    return {
+        'rss_mb': mem_info.rss / 1024 / 1024,  # Resident Set Size
+        'vms_mb': mem_info.vms / 1024 / 1024,  # Virtual Memory Size
+        'percent': process.memory_percent()
+    }
+
+# Global memory tracking
+peak_memory_mb = 0
+initial_memory_mb = 0
+
+def update_peak_memory():
+    """Update peak memory usage"""
+    global peak_memory_mb
+    current = get_memory_usage_mb()
+    if current > peak_memory_mb:
+        peak_memory_mb = current
+    return current
+
+# Environment variables
+TOTAL_NODES = int(os.environ.get('TOTAL_NODES', 3))
 NODE_NUMBER = int(os.environ.get('NODE_NUMBER', 0))
 NODE_0_IP = os.environ.get('NODE_0_IP', 'localhost:8000')
-NODE_1_IP = os.environ.get('NODE_1_IP', 'localhost:8000')
-NODE_2_IP = os.environ.get('NODE_2_IP', 'localhost:8000')
+NODE_1_IP = os.environ.get('NODE_1_IP', 'localhost:8001')
+NODE_2_IP = os.environ.get('NODE_2_IP', 'localhost:8002')
 FAISS_INDEX_PATH = os.environ.get('FAISS_INDEX_PATH', 'faiss_index.bin')
 DOCUMENTS_DIR = os.environ.get('DOCUMENTS_DIR', 'documents/')
 
@@ -34,19 +70,13 @@ DOCUMENTS_DIR = os.environ.get('DOCUMENTS_DIR', 'documents/')
 CONFIG = {
     'faiss_index_path': FAISS_INDEX_PATH,
     'documents_path': DOCUMENTS_DIR,
-    'faiss_dim': 768, #You must use this dimension
-    'max_tokens': 128, #You must use this max token limit
-    'retrieval_k': 10, #You must retrieve this many documents from the FAISS index
-    'truncate_length': 512 # You must use this truncate length
+    'faiss_dim': 768,
+    'max_tokens': 128,
+    'retrieval_k': 10,
+    'truncate_length': 512,
+    'batch_size': 8,
+    'batch_timeout': 2.0,
 }
-
-# Flask app
-app = Flask(__name__)
-
-# Request queue and results storage
-request_queue = Queue()
-results = {}
-results_lock = threading.Lock()
 
 @dataclass
 class PipelineRequest:
@@ -60,139 +90,112 @@ class PipelineResponse:
     generated_response: str
     sentiment: str
     is_toxic: str
-    processing_time: float
 
-class MonolithicPipeline:
+# ==================================================================
+# SERVICE CLASSES
+# ==================================================================
 
-    """
-    Deliberately inefficient monolithic pipeline
-    """
-    
+class EmbeddingService:
+    """Generates embeddings - Node 0"""
     def __init__(self):
+        print("[EmbeddingService] Loading model...")
+        mem_before = get_memory_usage_mb()
+        
         self.device = torch.device('cpu')
-        print(f"Initializing pipeline on {self.device}")
-        print(f"Node {NODE_NUMBER}/{TOTAL_NODES}")
-        print(f"FAISS index path: {CONFIG['faiss_index_path']}")
-        print(f"Documents path: {CONFIG['documents_path']}")
+        self.model = SentenceTransformer('BAAI/bge-base-en-v1.5').to(self.device)
         
-        # Model names
-        self.embedding_model_name = 'BAAI/bge-base-en-v1.5'
-        self.reranker_model_name = 'BAAI/bge-reranker-base'
-        self.llm_model_name = 'Qwen/Qwen2.5-0.5B-Instruct'
-        self.sentiment_model_name = 'nlptown/bert-base-multilingual-uncased-sentiment'
-        self.safety_model_name = 'unitary/toxic-bert'
+        mem_after = get_memory_usage_mb()
+        mem_used = mem_after - mem_before
+        print(f"[EmbeddingService] Ready (loaded {mem_used:.1f} MB, total: {mem_after:.1f} MB)")
+        update_peak_memory()
     
-    def process_request(self, request: PipelineRequest) -> PipelineResponse:
-        """
-        Backwards-compatible single-request entry point that delegates
-        to the batch processor with a batch size of 1.
-        """
-        responses = self.process_batch([request])
-        return responses[0]
+    def generate_batch(self, texts: List[str]) -> np.ndarray:
+        start = time.time()
+        result = self.model.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
+        elapsed = time.time() - start
+        return result, elapsed
 
-    def process_batch(self, requests: List[PipelineRequest]) -> List[PipelineResponse]:
-        """
-        Main pipeline execution for a batch of requests.
-        """
-        if not requests:
-            return []
 
-        batch_size = len(requests)
-        start_times = [time.time() for _ in requests]
-        queries = [req.query for req in requests]
-
-        print("\n" + "="*60)
-        print(f"Processing batch of {batch_size} requests")
-        print("="*60)
-        for request in requests:
-            print(f"- {request.request_id}: {request.query[:50]}...")
+class RetrievalService:
+    """FAISS + reranking - Node 1"""
+    def __init__(self):
+        print("[RetrievalService] Loading FAISS index...")
+        mem_before = get_memory_usage_mb()
         
-        # Step 1: Generate embeddings
-        print("\n[Step 1/7] Generating embeddings for batch...")
-        query_embeddings = self._generate_embeddings_batch(queries)
-
-        # Step 2: FAISS ANN search
-        print("\n[Step 2/7] Performing FAISS ANN search for batch...")
-        doc_id_batches = self._faiss_search_batch(query_embeddings)
-
-        # Step 3: Fetch documents from disk
-        print("\n[Step 3/7] Fetching documents for batch...")
-        documents_batch = self._fetch_documents_batch(doc_id_batches)
-
-        # Step 4: Rerank documents
-        print("\n[Step 4/7] Reranking documents for batch...")
-        reranked_docs_batch = self._rerank_documents_batch(
-            queries,
-            documents_batch
-        )
-
-        # Step 5: Generate LLM responses
-        print("\n[Step 5/7] Generating LLM responses for batch...")
-        responses_text = self._generate_responses_batch(
-            queries,
-            reranked_docs_batch
-        )
-
-        # Step 6: Sentiment analysis
-        print("\n[Step 6/7] Analyzing sentiment for batch...")
-        sentiments = self._analyze_sentiment_batch(responses_text)
-
-        # Step 7: Safety filter on responses
-        print("\n[Step 7/7] Applying safety filter to batch...")
-        toxicity_flags = self._filter_response_safety_batch(responses_text)
+        self.device = torch.device('cpu')
+        self.faiss_index = faiss.read_index(CONFIG['faiss_index_path'])
         
-        responses = []
-        for idx, request in enumerate(requests):
-            processing_time = time.time() - start_times[idx]
-            print(f"\n✓ Request {request.request_id} processed in {processing_time:.2f} seconds")
-            sensitivity_result = "true" if toxicity_flags[idx] else "false"
-            responses.append(PipelineResponse(
-                request_id=request.request_id,
-                generated_response=responses_text[idx],
-                sentiment=sentiments[idx],
-                is_toxic=sensitivity_result,
-                processing_time=processing_time
-            ))
+        mem_after = get_memory_usage_mb()
+        mem_used = mem_after - mem_before
+        print(f"[RetrievalService] FAISS loaded: {self.faiss_index.ntotal} vectors ({mem_used:.1f} MB, total: {mem_after:.1f} MB)")
+        update_peak_memory()
         
-        return responses
+        db_path = os.path.join(CONFIG['documents_path'], 'documents.db')
+        self.db_conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.db_lock = threading.Lock()
+        
+        print("[RetrievalService] Loading reranker...")
+        mem_before = get_memory_usage_mb()
+        
+        self.reranker_tokenizer = AutoTokenizer.from_pretrained('BAAI/bge-reranker-base')
+        self.reranker_model = AutoModelForSequenceClassification.from_pretrained(
+            'BAAI/bge-reranker-base'
+        ).to(self.device)
+        self.reranker_model.eval()
+        
+        mem_after = get_memory_usage_mb()
+        mem_used = mem_after - mem_before
+        print(f"[RetrievalService] Reranker loaded ({mem_used:.1f} MB, total: {mem_after:.1f} MB)")
+        update_peak_memory()
     
-    def _generate_embeddings_batch(self, texts: List[str]) -> np.ndarray:
-        """Step 2: Generate embeddings for a batch of queries"""
-        model = SentenceTransformer(self.embedding_model_name).to(self.device)
-        embeddings = model.encode(
-            texts,
-            normalize_embeddings=True,
-            convert_to_numpy=True
-        )
-        del model
-        gc.collect()
-        return embeddings
-    
-    def _faiss_search_batch(self, query_embeddings: np.ndarray) -> List[List[int]]:
-        """Step 3: Perform FAISS ANN search for a batch of embeddings"""
-        if not os.path.exists(CONFIG['faiss_index_path']):
-            raise FileNotFoundError("FAISS index not found. Please create the index before running the pipeline.")
+    def process_batch(self, embeddings: List[List[float]], queries: List[str]) -> tuple:
+        timings = {}
         
-        print("Loading FAISS index")
-        index = faiss.read_index(CONFIG['faiss_index_path'])
-        query_embeddings = query_embeddings.astype('float32')
-        _, indices = index.search(query_embeddings, CONFIG['retrieval_k'])
-        del index
-        gc.collect()
-        return [row.tolist() for row in indices]
-    
-    def _fetch_documents_batch(self, doc_id_batches: List[List[int]]) -> List[List[Dict]]:
-        """Step 4: Fetch documents for each query in the batch using SQLite"""
-        db_path = f"{CONFIG['documents_path']}/documents.db"
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
+        # FAISS search
+        start = time.time()
+        embeddings_array = np.array(embeddings, dtype='float32')
+        _, indices = self.faiss_index.search(embeddings_array, CONFIG['retrieval_k'])
+        timings['faiss_search'] = time.time() - start
+        
+        # Fetch documents
+        start = time.time()
         documents_batch = []
-        for doc_ids in doc_id_batches:
-            documents = []
+        for doc_ids in indices:
+            documents = self._fetch_documents(doc_ids.tolist())
+            documents_batch.append(documents)
+        timings['document_fetch'] = time.time() - start
+        
+        # Rerank
+        start = time.time()
+        reranked_batch = []
+        for query, documents in zip(queries, documents_batch):
+            if not documents:
+                reranked_batch.append([])
+                continue
+            
+            pairs = [[query, doc['content']] for doc in documents]
+            with torch.no_grad():
+                inputs = self.reranker_tokenizer(
+                    pairs, padding=True, truncation=True,
+                    return_tensors='pt', max_length=CONFIG['truncate_length']
+                ).to(self.device)
+                scores = self.reranker_model(**inputs, return_dict=True).logits.view(-1, ).float()
+            
+            doc_scores = list(zip(documents, scores.cpu().numpy()))
+            doc_scores.sort(key=lambda x: x[1], reverse=True)
+            reranked_batch.append([doc for doc, _ in doc_scores])
+        timings['reranking'] = time.time() - start
+        
+        return reranked_batch, timings
+    
+    def _fetch_documents(self, doc_ids: List[int]) -> List[Dict]:
+        documents = []
+        with self.db_lock:
+            cursor = self.db_conn.cursor()
             for doc_id in doc_ids:
                 cursor.execute(
                     'SELECT doc_id, title, content, category FROM documents WHERE doc_id = ?',
-                    (doc_id,)
+                    (int(doc_id),)
                 )
                 result = cursor.fetchone()
                 if result:
@@ -202,231 +205,522 @@ class MonolithicPipeline:
                         'content': result[2],
                         'category': result[3]
                     })
-            documents_batch.append(documents)
-        conn.close()
-        return documents_batch
-    
-    def _rerank_documents_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[List[Dict]]:
-        """Step 5: Rerank retrieved documents for each query in the batch"""
-        tokenizer = AutoTokenizer.from_pretrained(self.reranker_model_name)
-        model = AutoModelForSequenceClassification.from_pretrained(self.reranker_model_name).to(self.device)
-        model.eval()
-        reranked_batches = []
-        for query, documents in zip(queries, documents_batch):
-            if not documents:
-                reranked_batches.append([])
-                continue
-            pairs = [[query, doc['content']] for doc in documents]
-            with torch.no_grad():
-                inputs = tokenizer(
-                    pairs,
-                    padding=True,
-                    truncation=True,
-                    return_tensors='pt',
-                    max_length=CONFIG['truncate_length']
-                ).to(self.device)
-                scores = model(**inputs, return_dict=True).logits.view(-1, ).float()
-            doc_scores = list(zip(documents, scores))
-            doc_scores.sort(key=lambda x: x[1], reverse=True)
-            reranked_batches.append([doc for doc, _ in doc_scores])
-        del model, tokenizer
-        gc.collect()
-        return reranked_batches
-    
-    def _generate_responses_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[str]:
-        """Step 6: Generate LLM responses for each query in the batch"""
-        model = AutoModelForCausalLM.from_pretrained(
-            self.llm_model_name,
-            dtype=torch.float16,
+        return documents
+
+
+class GenerationService:
+    """LLM generation - Node 2"""
+    def __init__(self):
+        print("[GenerationService] Loading LLM...")
+        mem_before = get_memory_usage_mb()
+        
+        self.device = torch.device('cpu')
+        self.model = AutoModelForCausalLM.from_pretrained(
+            'Qwen/Qwen2.5-0.5B-Instruct',
+            torch_dtype=torch.float16,
         ).to(self.device)
-        tokenizer = AutoTokenizer.from_pretrained(self.llm_model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained('Qwen/Qwen2.5-0.5B-Instruct')
+        
+        mem_after = get_memory_usage_mb()
+        mem_used = mem_after - mem_before
+        print(f"[GenerationService] LLM loaded ({mem_used:.1f} MB, total: {mem_after:.1f} MB)")
+        update_peak_memory()
+    
+    def generate_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> tuple:
+        start = time.time()
         responses = []
         for query, documents in zip(queries, documents_batch):
-            context = "\n".join([f"- {doc['title']}: {doc['content'][:200]}" for doc in documents[:3]])
+            context = "\n".join([
+                f"- {doc['title']}: {doc['content'][:200]}" 
+                for doc in documents[:3]
+            ])
+            
             messages = [
                 {"role": "system",
                  "content": "When given Context and Question, reply as 'Answer: <final answer>' only."},
                 {"role": "user",
                  "content": f"Context:\n{context}\n\nQuestion: {query}\n\nAnswer:"}
             ]
-            text = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True
+            
+            text = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
             )
-            model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
-            generated_ids = model.generate(
+            
+            model_inputs = self.tokenizer([text], return_tensors="pt").to(self.device)
+            generated_ids = self.model.generate(
                 **model_inputs,
                 max_new_tokens=CONFIG['max_tokens'],
                 temperature=0.01,
-                pad_token_id=tokenizer.eos_token_id
+                pad_token_id=self.tokenizer.eos_token_id
             )
+            
             generated_ids = [
-                output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+                output_ids[len(input_ids):] 
+                for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
             ]
-            response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            response = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
             responses.append(response)
-        del model, tokenizer
-        gc.collect()
-        return responses
-    
-    def _analyze_sentiment_batch(self, texts: List[str]) -> List[str]:
-        """Step 7: Analyze sentiment for each generated response"""
-        classifier = hf_pipeline(
+        
+        elapsed = time.time() - start
+        return responses, elapsed
+
+
+class SentimentService:
+    """Sentiment analysis - Node 0"""
+    def __init__(self):
+        print("[SentimentService] Loading model...")
+        mem_before = get_memory_usage_mb()
+        
+        self.device = torch.device('cpu')
+        self.classifier = hf_pipeline(
             "sentiment-analysis",
-            model=self.sentiment_model_name,
+            model='nlptown/bert-base-multilingual-uncased-sentiment',
             device=self.device
         )
-        truncated_texts = [text[:CONFIG['truncate_length']] for text in texts]
-        raw_results = classifier(truncated_texts)
-        sentiment_map = {
+        self.sentiment_map = {
             '1 star': 'very negative',
             '2 stars': 'negative',
             '3 stars': 'neutral',
             '4 stars': 'positive',
             '5 stars': 'very positive'
         }
-        sentiments = []
-        for result in raw_results:
-            sentiments.append(sentiment_map.get(result['label'], 'neutral'))
-        del classifier
-        gc.collect()
-        return sentiments
+        
+        mem_after = get_memory_usage_mb()
+        mem_used = mem_after - mem_before
+        print(f"[SentimentService] Ready ({mem_used:.1f} MB, total: {mem_after:.1f} MB)")
+        update_peak_memory()
     
-    def _filter_response_safety_batch(self, texts: List[str]) -> List[bool]:
-        """Step 8: Filter responses for safety for each entry in the batch"""
-        classifier = hf_pipeline(
+    def analyze_batch(self, texts: List[str]) -> tuple:
+        start = time.time()
+        truncated = [text[:CONFIG['truncate_length']] for text in texts]
+        results = self.classifier(truncated)
+        sentiments = [self.sentiment_map.get(r['label'], 'neutral') for r in results]
+        elapsed = time.time() - start
+        return sentiments, elapsed
+
+
+class SafetyService:
+    """Toxicity detection - Node 0"""
+    def __init__(self):
+        print("[SafetyService] Loading model...")
+        mem_before = get_memory_usage_mb()
+        
+        self.device = torch.device('cpu')
+        self.classifier = hf_pipeline(
             "text-classification",
-            model=self.safety_model_name,
+            model='unitary/toxic-bert',
             device=self.device
         )
-        truncated_texts = [text[:CONFIG['truncate_length']] for text in texts]
-        raw_results = classifier(truncated_texts)
-        toxicity_flags = []
-        for result in raw_results:
-            toxicity_flags.append(result['score'] > 0.5)
-        del classifier
-        gc.collect()
-        return toxicity_flags
-
-
-# Global pipeline instance
-pipeline = None
-
-def process_requests_worker():
-    """Worker thread that processes requests from the queue"""
-    global pipeline
-    while True:
-        try:
-            request_data = request_queue.get()
-            if request_data is None:  # Shutdown signal
-                break
-            
-            # Create request object
-            req = PipelineRequest(
-                request_id=request_data['request_id'],
-                query=request_data['query'],
-                timestamp=time.time()
-            )
-            
-            # Process request
-            response = pipeline.process_request(req)
-            
-            # Store result
-            with results_lock:
-                results[request_data['request_id']] = {
-                    'request_id': response.request_id,
-                    'generated_response': response.generated_response,
-                    'sentiment': response.sentiment,
-                    'is_toxic': response.is_toxic
-                }
-            
-            request_queue.task_done()
-        except Exception as e:
-            print(f"Error processing request: {e}")
-            request_queue.task_done()
-
-
-@app.route('/query', methods=['POST'])
-def handle_query():
-    """Handle incoming query requests"""
-    try:
-        data = request.json
-        request_id = data.get('request_id')
-        query = data.get('query')
         
-        if not request_id or not query:
-            return jsonify({'error': 'Missing request_id or query'}), 400
-        
-        # Check if result already exists (request already processed)
-        with results_lock:
-            if request_id in results:
-                return jsonify(results[request_id]), 200
-        
-        print(f"queueing request {request_id}")
-        # Add to queue
-        request_queue.put({
-            'request_id': request_id,
-            'query': query
-        })
+        mem_after = get_memory_usage_mb()
+        mem_used = mem_after - mem_before
+        print(f"[SafetyService] Ready ({mem_used:.1f} MB, total: {mem_after:.1f} MB)")
+        update_peak_memory()
+    
+    def check_batch(self, texts: List[str]) -> tuple:
+        start = time.time()
+        truncated = [text[:CONFIG['truncate_length']] for text in texts]
+        results = self.classifier(truncated)
+        toxicity = [r['score'] > 0.5 for r in results]
+        elapsed = time.time() - start
+        return toxicity, elapsed
 
-        # Wait for processing (with timeout). Very inefficient - would suggest using a more efficient waiting and timeout mechanism.
-        timeout = 300  # 5 minutes
-        start_wait = time.time()
+
+# ==================================================================
+# BATCHING
+# ==================================================================
+
+class BatchAccumulator:
+    def __init__(self, max_size: int, timeout: float):
+        self.max_size = max_size
+        self.timeout = timeout
+        self.batch = []
+        self.lock = threading.Lock()
+        self.first_item_time = None
+    
+    def add(self, item) -> Optional[List]:
+        with self.lock:
+            if not self.batch:
+                self.first_item_time = time.time()
+            self.batch.append(item)
+            
+            # Process if batch is full
+            if len(self.batch) >= self.max_size:
+                return self._extract()
+        return None
+    
+    def check(self) -> Optional[List]:
+        with self.lock:
+            if self.batch and self.first_item_time:
+                # Process if timeout reached since first item
+                if time.time() - self.first_item_time >= self.timeout:
+                    return self._extract()
+        return None
+    
+    def _extract(self) -> List:
+        batch = self.batch
+        self.batch = []
+        self.first_item_time = None
+        return batch
+
+
+# ==================================================================
+# NODE 0: FRONTEND
+# ==================================================================
+
+def create_node0_app():
+    app = Flask(__name__)
+    
+    print("\n" + "="*60)
+    print("NODE 0: FRONTEND + ORCHESTRATION")
+    print("="*60)
+    
+    # Initialize services
+    embedding_svc = EmbeddingService()
+    sentiment_svc = SentimentService()
+    safety_svc = SafetyService()
+    
+    # State
+    results = {}
+    results_lock = threading.Lock()
+    batch_acc = BatchAccumulator(CONFIG['batch_size'], CONFIG['batch_timeout'])
+    
+    def process_batches():
+        print("[Node0] Batch worker started")
+        
+        # Profiling data
+        batch_count = 0
+        total_requests = 0
+        stage_times = {
+            'embedding': [],
+            'faiss_search': [],
+            'document_fetch': [],
+            'reranking': [],
+            'llm_generation': [],
+            'sentiment': [],
+            'safety': [],
+            'total_batch': []
+        }
+        
         while True:
-            with results_lock:
-                if request_id in results:
-                    result = results.pop(request_id)
-                    return jsonify(result), 200
+            try:
+                time.sleep(0.5)
+                batch = batch_acc.check()
+                if not batch:
+                    continue
+                
+                batch_start = time.time()
+                batch_count += 1
+                batch_size = len(batch)
+                total_requests += batch_size
+                
+                mem_before = get_memory_usage_mb()
+                
+                print(f"\n{'='*60}")
+                print(f"[Node0] Processing batch #{batch_count} ({batch_size} requests)")
+                print(f"[Node0] Memory: {mem_before:.1f} MB")
+                print(f"{'='*60}")
+                
+                request_ids = [item['request_id'] for item in batch]
+                queries = [item['query'] for item in batch]
+                
+                # Step 1: Embeddings
+                print(f"[Node0] Step 1/7: Generating embeddings...")
+                embeddings, embed_time = embedding_svc.generate_batch(queries)
+                stage_times['embedding'].append(embed_time)
+                print(f"  └─ Completed in {embed_time:.3f}s ({embed_time/batch_size:.3f}s per request)")
+                
+                # Step 2-4: Call Node 1 (FAISS + Docs + Rerank)
+                print(f"[Node0] Step 2-4: Calling Node 1 for retrieval...")
+                node1_start = time.time()
+                response = requests.post(
+                    f"http://{NODE_1_IP}/retrieve_batch",
+                    json={'embeddings': embeddings.tolist(), 'queries': queries},
+                    timeout=120
+                )
+                result = response.json()
+                documents_batch = result['documents_batch']
+                node1_timings = result['timings']
+                node1_total = time.time() - node1_start
+                
+                stage_times['faiss_search'].append(node1_timings['faiss_search'])
+                stage_times['document_fetch'].append(node1_timings['document_fetch'])
+                stage_times['reranking'].append(node1_timings['reranking'])
+                
+                print(f"  ├─ FAISS search: {node1_timings['faiss_search']:.3f}s")
+                print(f"  ├─ Document fetch: {node1_timings['document_fetch']:.3f}s")
+                print(f"  ├─ Reranking: {node1_timings['reranking']:.3f}s")
+                print(f"  └─ Total (incl. network): {node1_total:.3f}s")
+                
+                # Step 5: Call Node 2 (LLM)
+                print(f"[Node0] Step 5/7: Calling Node 2 for generation...")
+                node2_start = time.time()
+                response = requests.post(
+                    f"http://{NODE_2_IP}/generate_batch",
+                    json={'queries': queries, 'documents_batch': documents_batch},
+                    timeout=300
+                )
+                result = response.json()
+                responses = result['responses']
+                llm_time = result['timing']
+                node2_total = time.time() - node2_start
+                
+                stage_times['llm_generation'].append(llm_time)
+                print(f"  ├─ LLM generation: {llm_time:.3f}s ({llm_time/batch_size:.3f}s per request)")
+                print(f"  └─ Total (incl. network): {node2_total:.3f}s")
+                
+                # Step 6-7: Sentiment + Safety (parallel)
+                print(f"[Node0] Step 6-7: Analyzing sentiment and safety (parallel)...")
+                parallel_start = time.time()
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    sentiment_future = executor.submit(sentiment_svc.analyze_batch, responses)
+                    safety_future = executor.submit(safety_svc.check_batch, responses)
+                    
+                    sentiments, sentiment_time = sentiment_future.result()
+                    toxicity, safety_time = safety_future.result()
+                
+                parallel_total = time.time() - parallel_start
+                stage_times['sentiment'].append(sentiment_time)
+                stage_times['safety'].append(safety_time)
+                
+                print(f"  ├─ Sentiment analysis: {sentiment_time:.3f}s")
+                print(f"  ├─ Safety check: {safety_time:.3f}s")
+                print(f"  └─ Parallel execution: {parallel_total:.3f}s (max of both)")
+                
+                # Store results
+                with results_lock:
+                    for i, req_id in enumerate(request_ids):
+                        results[req_id] = {
+                            'request_id': req_id,
+                            'generated_response': responses[i],
+                            'sentiment': sentiments[i],
+                            'is_toxic': 'true' if toxicity[i] else 'false'
+                        }
+                
+                batch_total = time.time() - batch_start
+                stage_times['total_batch'].append(batch_total)
+                mem_after = get_memory_usage_mb()
+                update_peak_memory()
+                
+                print(f"\n{'='*60}")
+                print(f"[Node0] ✓ Batch #{batch_count} complete")
+                print(f"  Total time: {batch_total:.3f}s")
+                print(f"  Throughput: {batch_size/batch_total:.2f} req/s")
+                print(f"  Avg latency: {batch_total/batch_size:.3f}s per request")
+                print(f"  Memory: {mem_after:.1f} MB (peak: {peak_memory_mb:.1f} MB)")
+                print(f"{'='*60}")
+                
+                # Print cumulative statistics every 5 batches
+                if batch_count % 5 == 0:
+                    print(f"\n{'='*60}")
+                    print(f"CUMULATIVE STATISTICS (after {batch_count} batches, {total_requests} requests)")
+                    print(f"{'='*60}")
+                    print(f"Average Stage Times (per batch):")
+                    print(f"  Embedding:        {np.mean(stage_times['embedding']):.3f}s")
+                    print(f"  FAISS search:     {np.mean(stage_times['faiss_search']):.3f}s")
+                    print(f"  Document fetch:   {np.mean(stage_times['document_fetch']):.3f}s")
+                    print(f"  Reranking:        {np.mean(stage_times['reranking']):.3f}s")
+                    print(f"  LLM generation:   {np.mean(stage_times['llm_generation']):.3f}s")
+                    print(f"  Sentiment:        {np.mean(stage_times['sentiment']):.3f}s")
+                    print(f"  Safety:           {np.mean(stage_times['safety']):.3f}s")
+                    print(f"  Total batch:      {np.mean(stage_times['total_batch']):.3f}s")
+                    print(f"\nAverage per-request times:")
+                    avg_batch_size = total_requests / batch_count
+                    print(f"  Embedding:        {np.mean(stage_times['embedding'])/avg_batch_size:.3f}s")
+                    print(f"  FAISS search:     {np.mean(stage_times['faiss_search'])/avg_batch_size:.3f}s")
+                    print(f"  Document fetch:   {np.mean(stage_times['document_fetch'])/avg_batch_size:.3f}s")
+                    print(f"  Reranking:        {np.mean(stage_times['reranking'])/avg_batch_size:.3f}s")
+                    print(f"  LLM generation:   {np.mean(stage_times['llm_generation'])/avg_batch_size:.3f}s")
+                    print(f"  Sentiment:        {np.mean(stage_times['sentiment'])/avg_batch_size:.3f}s")
+                    print(f"  Safety:           {np.mean(stage_times['safety'])/avg_batch_size:.3f}s")
+                    print(f"\nOverall throughput: {total_requests/sum(stage_times['total_batch']):.2f} req/s")
+                    print(f"Peak memory: {peak_memory_mb:.1f} MB")
+                    print(f"{'='*60}\n")
+                
+            except Exception as e:
+                print(f"[Node0] Error: {e}")
+                import traceback
+                traceback.print_exc()
+                if batch:
+                    with results_lock:
+                        for item in batch:
+                            results[item['request_id']] = {'error': str(e)}
+    
+    threading.Thread(target=process_batches, daemon=True).start()
+    
+    @app.route('/query', methods=['POST'])
+    def handle_query():
+        try:
+            data = request.json
+            request_id = data.get('request_id')
+            query = data.get('query')
             
-            if time.time() - start_wait > timeout:
-                return jsonify({'error': 'Request timeout'}), 504
+            if not request_id or not query:
+                return jsonify({'error': 'Missing request_id or query'}), 400
             
-            time.sleep(0.1)
+            batch_acc.add({'request_id': request_id, 'query': query, 'timestamp': time.time()})
+            
+            # Wait for result
+            timeout = 300
+            start = time.time()
+            while True:
+                with results_lock:
+                    if request_id in results:
+                        result = results.pop(request_id)
+                        if 'error' in result:
+                            return jsonify({'error': result['error']}), 500
+                        return jsonify(result), 200
+                
+                if time.time() - start > timeout:
+                    return jsonify({'error': 'Timeout'}), 504
+                
+                time.sleep(0.1)
         
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    
+    @app.route('/health', methods=['GET'])
+    def health():
+        return jsonify({'status': 'healthy', 'node': 0}), 200
+    
+    # Print memory summary
+    final_mem = get_memory_usage_mb()
+    print(f"\n{'='*60}")
+    print(f"[Node0] Initialization Complete")
+    print(f"  Total memory usage: {final_mem:.1f} MB")
+    print(f"  Peak memory usage: {peak_memory_mb:.1f} MB")
+    print(f"{'='*60}\n")
+    
+    print("\n[Node0] Ready!")
+    return app
 
 
-@app.route('/health', methods=['GET'])
-def health():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'healthy',
-        'node': NODE_NUMBER,
-        'total_nodes': TOTAL_NODES
-    }), 200
+# ==================================================================
+# NODE 1: RETRIEVAL
+# ==================================================================
 
+def create_node1_app():
+    app = Flask(__name__)
+    
+    print("\n" + "="*60)
+    print("NODE 1: RETRIEVAL SERVICE")
+    print("="*60)
+    
+    retrieval_svc = RetrievalService()
+    
+    @app.route('/retrieve_batch', methods=['POST'])
+    def retrieve_batch():
+        try:
+            data = request.json
+            embeddings = data['embeddings']
+            queries = data['queries']
+            
+            print(f"[Node1] Processing batch of {len(embeddings)}")
+            documents_batch, timings = retrieval_svc.process_batch(embeddings, queries)
+            
+            return jsonify({
+                'documents_batch': documents_batch,
+                'timings': timings
+            }), 200
+        except Exception as e:
+            print(f"[Node1] Error: {e}")
+            return jsonify({'error': str(e)}), 500
+    
+    @app.route('/health', methods=['GET'])
+    def health():
+        return jsonify({'status': 'healthy', 'node': 1}), 200
+    
+    # Print memory summary
+    final_mem = get_memory_usage_mb()
+    print(f"\n{'='*60}")
+    print(f"[Node1] Initialization Complete")
+    print(f"  Total memory usage: {final_mem:.1f} MB")
+    print(f"  Peak memory usage: {peak_memory_mb:.1f} MB")
+    print(f"  Available headroom: {16384 - final_mem:.1f} MB (out of 16384 MB)")
+    print(f"{'='*60}\n")
+    
+    print("\n[Node1] Ready!")
+    return app
+
+
+# ==================================================================
+# NODE 2: GENERATION
+# ==================================================================
+
+def create_node2_app():
+    app = Flask(__name__)
+    
+    print("\n" + "="*60)
+    print("NODE 2: GENERATION SERVICE")
+    print("="*60)
+    
+    generation_svc = GenerationService()
+    
+    @app.route('/generate_batch', methods=['POST'])
+    def generate_batch():
+        try:
+            data = request.json
+            queries = data['queries']
+            documents_batch = data['documents_batch']
+            
+            print(f"[Node2] Generating for batch of {len(queries)}")
+            responses, timing = generation_svc.generate_batch(queries, documents_batch)
+            
+            return jsonify({
+                'responses': responses,
+                'timing': timing
+            }), 200
+        except Exception as e:
+            print(f"[Node2] Error: {e}")
+            return jsonify({'error': str(e)}), 500
+    
+    @app.route('/health', methods=['GET'])
+    def health():
+        return jsonify({'status': 'healthy', 'node': 2}), 200
+    
+    # Print memory summary
+    final_mem = get_memory_usage_mb()
+    print(f"\n{'='*60}")
+    print(f"[Node2] Initialization Complete")
+    print(f"  Total memory usage: {final_mem:.1f} MB")
+    print(f"  Peak memory usage: {peak_memory_mb:.1f} MB")
+    print(f"{'='*60}\n")
+    
+    print("\n[Node2] Ready!")
+    return app
+
+
+# ==================================================================
+# MAIN
+# ==================================================================
 
 def main():
-    """
-    Main execution function
-    """
-    global pipeline
+    global initial_memory_mb, peak_memory_mb
     
-    print("="*60)
-    print("MONOLITHIC CUSTOMER SUPPORT PIPELINE")
-    print("="*60)
-    print(f"\nRunning on Node {NODE_NUMBER} of {TOTAL_NODES} nodes")
-    print(f"Node IPs: 0={NODE_0_IP}, 1={NODE_1_IP}, 2={NODE_2_IP}")
-    print("\nNOTE: This implementation is deliberately inefficient.")
-    print("Your task is to optimize this for a 3-node cluster.\n")
+    initial_memory_mb = get_memory_usage_mb()
+    peak_memory_mb = initial_memory_mb
     
-    # Initialize pipeline
-    print("Initializing pipeline...")
-    pipeline = MonolithicPipeline()
-    print("Pipeline initialized!")
+    print("\n" + "="*70)
+    print("DISTRIBUTED ML INFERENCE PIPELINE")
+    print("="*70)
+    print(f"Node {NODE_NUMBER}/{TOTAL_NODES}")
+    print(f"Initial memory: {initial_memory_mb:.1f} MB")
+    print("="*70 + "\n")
     
-    # Start worker thread
-    worker_thread = threading.Thread(target=process_requests_worker, daemon=True)
-    worker_thread.start()
-    print("Worker thread started!")
+    if NODE_NUMBER == 0:
+        app = create_node0_app()
+        port = int(NODE_0_IP.split(':')[1]) if ':' in NODE_0_IP else 8000
+    elif NODE_NUMBER == 1:
+        app = create_node1_app()
+        port = int(NODE_1_IP.split(':')[1]) if ':' in NODE_1_IP else 8001
+    elif NODE_NUMBER == 2:
+        app = create_node2_app()
+        port = int(NODE_2_IP.split(':')[1]) if ':' in NODE_2_IP else 8002
+    else:
+        raise ValueError(f"Invalid NODE_NUMBER: {NODE_NUMBER}")
     
-    # Start Flask server
-    print(f"\nStarting Flask server")
-    hostname = NODE_0_IP.split(':')[0]
-    port = int(NODE_0_IP.split(':')[1]) if ':' in NODE_0_IP else 8000
-    app.run(host=hostname, port=port, threaded=True)
+    print(f"\nStarting server on 0.0.0.0:{port}\n")
+    app.run(host='0.0.0.0', port=port, threaded=True)
 
 
 if __name__ == "__main__":
