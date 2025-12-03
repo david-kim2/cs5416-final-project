@@ -1,0 +1,149 @@
+{
+  "monolithic": {
+    "pipeline": "Monolithic",
+    "total_requests": 6,
+    "successful_requests": 6,
+    "failed_requests": 0,
+    "total_time": 312.8442451953888,
+    "avg_latency": 50.47217277685801,
+    "min_latency": 23.3711678981781,
+    "max_latency": 116.16477155685425,
+    "throughput": 0.019178872848540536,
+    "results": [
+      {
+        "success": true,
+        "latency": 116.16477155685425,
+        "response": {
+          "generated_response": "To return a defective product, you should follow these steps:\n\n1. **Check for Defects**: Ensure that your product meets all specifications and standards before returning it to the store or retailer.\n\n2. **Document Your Issue**: Keep detailed records of when and where you received the defective item, along with any symptoms or issues you experienced.\n\n3. **Contact Customer Support**: Reach out to the company's customer service department by phone or email. Provide them with the details of your defective product and any relevant information such as the model number, serial number, and date of purchase.\n\n4. **Provide a Replacement**: If possible, request a",
+          "is_toxic": "false",
+          "request_id": "test_Monolithic_1764781116_0",
+          "sentiment": "very negative"
+        }
+      },
+      {
+        "success": true,
+        "latency": 31.265923738479614,
+        "response": {
+          "generated_response": "Answer: I'm sorry, but I don't have any specific information about a refund policy for documents 153513, 4412273, or 2679910. These documents do not contain any information related to refunds. If you need help with something else, please let me know!",
+          "is_toxic": "false",
+          "request_id": "test_Monolithic_1764781234_1",
+          "sentiment": "very negative"
+        }
+      },
+      {
+        "success": true,
+        "latency": 51.51329779624939,
+        "response": {
+          "generated_response": "Answer: Your order has not been received yet. Please check your tracking number (ABC123) to see if it matches the status of your order. If you have any other questions or need further assistance, please let me know.",
+          "is_toxic": "false",
+          "request_id": "test_Monolithic_1764781268_2",
+          "sentiment": "very negative"
+        }
+      },
+      {
+        "success": true,
+        "latency": 39.856560945510864,
+        "response": {
+          "generated_response": "To update your billing information, you can follow these steps:\n\n1. Log in to your account on the website or platform where you registered for billing information.\n2. Navigate to the section that provides options for updating your billing details.\n3. Select the option that allows you to change your billing information.\n4. Fill out the necessary fields with the new information provided by the company.\n5. Submit your request to ensure it is processed correctly.\n\nRemember to check the terms and conditions of any changes before proceeding with updates.",
+          "is_toxic": "false",
+          "request_id": "test_Monolithic_1764781321_3",
+          "sentiment": "positive"
+        }
+      },
+      {
+        "success": true,
+        "latency": 23.3711678981781,
+        "response": {
+          "generated_response": "Answer: No",
+          "is_toxic": "false",
+          "request_id": "test_Monolithic_1764781363_4",
+          "sentiment": "very negative"
+        }
+      },
+      {
+        "success": true,
+        "latency": 40.661314725875854,
+        "response": {
+          "generated_response": "Answer: No, you cannot change your shipping address after placing an order. Once you place an order, it's typically done at a specific time or location, and once placed, it can't be changed.",
+          "is_toxic": "false",
+          "request_id": "test_Monolithic_1764781388_5",
+          "sentiment": "very negative"
+        }
+      }
+    ]
+  },
+  "distributed": {
+    "pipeline": "Distributed",
+    "total_requests": 6,
+    "successful_requests": 6,
+    "failed_requests": 0,
+    "total_time": 250.62175846099854,
+    "avg_latency": 40.10139584541321,
+    "min_latency": 27.945164442062378,
+    "max_latency": 57.658263206481934,
+    "throughput": 0.023940459267560815,
+    "results": [
+      {
+        "success": true,
+        "latency": 57.658263206481934,
+        "response": {
+          "generated_response": "To return a defective product, you should follow these steps:\n\n1. **Check for Defects**: Ensure that your product meets all specifications and standards before returning it to the store or retailer.\n\n2. **Document Your Issue**: Keep detailed records of when and where you received the defective item, along with any symptoms or issues you experienced.\n\n3. **Contact Customer Support**: Reach out to the company's customer service department by phone or email. Provide them with the details of your defective product and any relevant information such as the model number, serial number, and date of purchase.\n\n4. **Provide a Replacement**: If possible, request a",
+          "is_toxic": "false",
+          "request_id": "test_Distributed_1764781429_0",
+          "sentiment": "very negative"
+        }
+      },
+      {
+        "success": true,
+        "latency": 27.945164442062378,
+        "response": {
+          "generated_response": "Answer: I'm sorry, but I don't have any specific information about a refund policy for documents 153513, 4412273, or 2679910. These documents do not contain any information related to refunds. If you need help with something else, feel free to ask!",
+          "is_toxic": "false",
+          "request_id": "test_Distributed_1764781489_1",
+          "sentiment": "very negative"
+        }
+      },
+      {
+        "success": true,
+        "latency": 40.95730471611023,
+        "response": {
+          "generated_response": "Answer: Your order has not been received yet. Please check your tracking number (ABC123) to see if it matches the status of your order. If you have any other questions or need further assistance, please let me know.",
+          "is_toxic": "false",
+          "request_id": "test_Distributed_1764781519_2",
+          "sentiment": "very negative"
+        }
+      },
+      {
+        "success": true,
+        "latency": 46.474331855773926,
+        "response": {
+          "generated_response": "To update your billing information, you can follow these steps:\n\n1. Log in to your account on the website or platform where you registered for billing information.\n2. Navigate to the section that provides options for updating your billing details.\n3. Select the option that allows you to change your billing information.\n4. Fill out the necessary fields with the new information provided by the company.\n5. Submit your request to ensure it is processed correctly.\n\nRemember to check the terms and conditions of any changes before proceeding with updates.",
+          "is_toxic": "false",
+          "request_id": "test_Distributed_1764781562_3",
+          "sentiment": "positive"
+        }
+      },
+      {
+        "success": true,
+        "latency": 28.08098292350769,
+        "response": {
+          "generated_response": "Answer: No",
+          "is_toxic": "false",
+          "request_id": "test_Distributed_1764781610_4",
+          "sentiment": "very negative"
+        }
+      },
+      {
+        "success": true,
+        "latency": 39.49232792854309,
+        "response": {
+          "generated_response": "Answer: No, you cannot change your shipping address after placing an order. Once you place an order, it's typically done at a specific time or location, and once placed, you can't make any changes to your shipping address until the order has been processed.",
+          "is_toxic": "false",
+          "request_id": "test_Distributed_1764781640_5",
+          "sentiment": "very negative"
+        }
+      }
+    ]
+  },
+  "timestamp": "20251203_120800"
+}
