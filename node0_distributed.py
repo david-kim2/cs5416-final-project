@@ -6,6 +6,12 @@ Node 0 Service: Orchestrator + Embedder
 - Routes to Node 1 for FAISS/retrieval/reranking
 - Routes to Node 2 for LLM/sentiment/safety
 - Returns final response to client
+
+Opportunistic Batching:
+- Dynamically adjusts batch size (2-16) based on queue depth
+- Low load: smaller batches (2-4) for lower latency
+- High load: larger batches (8-16) for better throughput
+- Adaptive timeout based on queue depth
 """
 
 import os
@@ -24,8 +30,13 @@ from sentence_transformers import SentenceTransformer
 NODE_0_IP = os.environ.get('NODE_0_IP', 'localhost:8000')
 NODE_1_IP = os.environ.get('NODE_1_IP', 'localhost:8001')
 NODE_2_IP = os.environ.get('NODE_2_IP', 'localhost:8002')
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '4'))
+
+# Opportunistic batching configuration
+MIN_BATCH_SIZE = int(os.environ.get('MIN_BATCH_SIZE', '2'))
+MAX_BATCH_SIZE = int(os.environ.get('MAX_BATCH_SIZE', '16'))
+BASE_BATCH_SIZE = int(os.environ.get('BASE_BATCH_SIZE', '4'))
 BATCH_TIMEOUT = float(os.environ.get('BATCH_TIMEOUT', '0.5'))
+MAX_BATCH_TIMEOUT = float(os.environ.get('MAX_BATCH_TIMEOUT', '2.0'))
 
 # Flask app
 app = Flask(__name__)
@@ -95,14 +106,46 @@ def send_to_node2(queries: List[str], documents_batch: List[List[Dict]], request
         print(f"[Node 0] Error communicating with Node 2: {e}")
         raise
 
+def calculate_optimal_batch_size(queue_depth: int) -> int:
+    """
+    Opportunistic batching: Calculate optimal batch size based on queue depth.
+    - High load (deep queue): Use larger batches for better throughput
+    - Low load (shallow queue): Use smaller batches for lower latency
+    """
+    if queue_depth <= 2:
+        # Very low load: small batches for low latency
+        return MIN_BATCH_SIZE
+    elif queue_depth <= 5:
+        # Low load: base batch size
+        return BASE_BATCH_SIZE
+    elif queue_depth <= 10:
+        # Medium load: increase batch size
+        return min(BASE_BATCH_SIZE * 2, MAX_BATCH_SIZE)
+    else:
+        # High load: use maximum batch size for maximum throughput
+        return MAX_BATCH_SIZE
+
+def calculate_adaptive_timeout(queue_depth: int) -> float:
+    """
+    Adaptive timeout: Longer timeout when queue is deep (more requests coming)
+    """
+    if queue_depth <= 2:
+        return BATCH_TIMEOUT  # Short timeout for low load
+    elif queue_depth <= 5:
+        return BATCH_TIMEOUT * 1.5
+    else:
+        return min(BATCH_TIMEOUT * 2, MAX_BATCH_TIMEOUT)  # Longer timeout for high load
+
 def process_batch_worker():
-    """Worker thread that processes batches from the queue"""
+    """Worker thread that processes batches from the queue with opportunistic batching"""
     global embedder
     while True:
         try:
             # Collect batch
             batch = []
             start_time = time.time()
+            optimal_batch_size = BASE_BATCH_SIZE
+            adaptive_timeout = BATCH_TIMEOUT
             
             # Wait for batch to fill or timeout
             while True:
@@ -110,13 +153,17 @@ def process_batch_worker():
                     queue_len = len(batch_queue)
                     elapsed = time.time() - start_time
                     
-                    if queue_len >= BATCH_SIZE:
-                        # Batch is full, take BATCH_SIZE items
-                        batch = batch_queue[:BATCH_SIZE]
-                        batch_queue[:] = batch_queue[BATCH_SIZE:]
+                    # Opportunistic: Recalculate batch size based on current queue depth
+                    optimal_batch_size = calculate_optimal_batch_size(queue_len)
+                    adaptive_timeout = calculate_adaptive_timeout(queue_len)
+                    
+                    if queue_len >= optimal_batch_size:
+                        # Batch is full (or exceeded optimal size), take optimal_batch_size items
+                        batch = batch_queue[:optimal_batch_size]
+                        batch_queue[:] = batch_queue[optimal_batch_size:]
                         break
-                    elif queue_len > 0 and elapsed >= BATCH_TIMEOUT:
-                        # Timeout reached, take what we have
+                    elif queue_len > 0 and elapsed >= adaptive_timeout:
+                        # Adaptive timeout reached, take what we have (opportunistic)
                         batch = batch_queue[:]
                         batch_queue[:] = []
                         break
@@ -131,7 +178,7 @@ def process_batch_worker():
                 time.sleep(0.1)
                 continue
             
-            print(f"\n[Node 0] Processing batch of {len(batch)} requests")
+            print(f"\n[Node 0] Processing batch of {len(batch)} requests (optimal: {optimal_batch_size}, queue depth was: {len(batch_queue) + len(batch)})")
             
             # Extract data
             request_ids = [item['request_id'] for item in batch]
@@ -244,8 +291,8 @@ def main():
     print(f"Node 0 IP: {NODE_0_IP}")
     print(f"Node 1 IP: {NODE_1_IP}")
     print(f"Node 2 IP: {NODE_2_IP}")
-    print(f"Batch size: {BATCH_SIZE}")
-    print(f"Batch timeout: {BATCH_TIMEOUT}s")
+    print(f"Opportunistic batching: {MIN_BATCH_SIZE}-{MAX_BATCH_SIZE} (base: {BASE_BATCH_SIZE})")
+    print(f"Adaptive timeout: {BATCH_TIMEOUT}-{MAX_BATCH_TIMEOUT}s")
     print("="*60)
     
     # Initialize embedder
