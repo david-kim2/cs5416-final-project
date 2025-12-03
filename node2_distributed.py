@@ -1,63 +1,76 @@
-#!/usr/bin/env python3
 """
-Node 2 Service: LLM + Sentiment Analysis + Safety Filter
+Node 2 Service: LLM Generation
 - Receives queries and documents from Node 0
 - Generates LLM responses
-- Analyzes sentiment
-- Applies safety filter
-- Returns results
+- Returns responses to Node 0
 """
 
 import os
 import gc
+import json
+import gzip
+import base64
 import torch
 from typing import List, Dict, Any
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from flask import Flask, request, jsonify
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    pipeline as hf_pipeline
-)
 
-# Read environment variables
+# Environment variables
 NODE_2_IP = os.environ.get('NODE_2_IP', 'localhost:8002')
-ONLY_CPU = os.environ.get('ONLY_CPU', 'true').lower() == 'true'
+USE_GPU = os.environ.get('USE_GPU', 'true').lower() == 'true'
+ENABLE_COMPRESSION = os.environ.get('ENABLE_COMPRESSION', 'true').lower() == 'true'
 
-# Configuration
 CONFIG = {
     'max_tokens': 128,
     'truncate_length': 512
 }
 
-# Flask app
 app = Flask(__name__)
 
+def get_device():
+    """Get device based on GPU availability and USE_GPU setting"""
+    if USE_GPU and torch.cuda.is_available():
+        device = torch.device('cuda')
+        print(f"[Device] GPU acceleration enabled: {torch.cuda.get_device_name(0)}")
+    else:
+        device = torch.device('cpu')
+        if USE_GPU:
+            print(f"[Device] GPU requested but not available, using CPU")
+        else:
+            print(f"[Device] Using CPU (GPU disabled)")
+    return device
+
+def compress_data(data: bytes) -> str:
+    """Compress data using gzip and return base64 encoded string"""
+    if not ENABLE_COMPRESSION:
+        return base64.b64encode(data).decode('utf-8')
+    compressed = gzip.compress(data)
+    return base64.b64encode(compressed).decode('utf-8')
+
+def decompress_data(encoded_data: str) -> bytes:
+    """Decompress base64 encoded gzip data"""
+    data = base64.b64decode(encoded_data.encode('utf-8'))
+    if not ENABLE_COMPRESSION:
+        return data
+    return gzip.decompress(data)
+
 class LLMService:
-    """Service for LLM generation, sentiment analysis, and safety filtering"""
-    
+    """Service for LLM response generation"""
     def __init__(self):
-        self.device = torch.device('cpu')
-        print(f"[Node 2] Initializing LLM service on {self.device}")
-        
-        # Model names
+        self.device = get_device()
         self.llm_model_name = 'Qwen/Qwen2.5-0.5B-Instruct'
-        self.sentiment_model_name = 'nlptown/bert-base-multilingual-uncased-sentiment'
-        self.safety_model_name = 'unitary/toxic-bert'
-        
-        # Load LLM
         print("[Node 2] Loading LLM model...")
         self.llm_model = AutoModelForCausalLM.from_pretrained(
             self.llm_model_name,
-            dtype=torch.float16,
+            dtype=torch.float16 if self.device.type == 'cuda' else torch.float32,
         ).to(self.device)
         self.llm_tokenizer = AutoTokenizer.from_pretrained(self.llm_model_name)
         print("[Node 2] LLM model loaded!")
-        
-        # Sentiment and safety models will be loaded on-demand to save memory
     
     def generate_responses_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[str]:
         """Generate LLM responses for each query in the batch"""
         responses = []
+        
         for query, documents in zip(queries, documents_batch):
             context = "\n".join([f"- {doc['title']}: {doc['content'][:200]}" for doc in documents[:3]])
             messages = [
@@ -72,101 +85,69 @@ class LLMService:
                 add_generation_prompt=True
             )
             model_inputs = self.llm_tokenizer([text], return_tensors="pt").to(self.llm_model.device)
-            generated_ids = self.llm_model.generate(
-                **model_inputs,
-                max_new_tokens=CONFIG['max_tokens'],
-                temperature=0.01,
-                pad_token_id=self.llm_tokenizer.eos_token_id
-            )
+            
+            with torch.no_grad():
+                generated_ids = self.llm_model.generate(
+                    **model_inputs,
+                    max_new_tokens=CONFIG['max_tokens'],
+                    temperature=0.01,
+                    pad_token_id=self.llm_tokenizer.eos_token_id
+                )
+            
             generated_ids = [
                 output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
             ]
             response = self.llm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
             responses.append(response)
+        
         return responses
-    
-    def analyze_sentiment_batch(self, texts: List[str]) -> List[str]:
-        """Analyze sentiment for each generated response"""
-        classifier = hf_pipeline(
-            "sentiment-analysis",
-            model=self.sentiment_model_name,
-            device=self.device
-        )
-        truncated_texts = [text[:CONFIG['truncate_length']] for text in texts]
-        raw_results = classifier(truncated_texts)
-        sentiment_map = {
-            '1 star': 'very negative',
-            '2 stars': 'negative',
-            '3 stars': 'neutral',
-            '4 stars': 'positive',
-            '5 stars': 'very positive'
-        }
-        sentiments = []
-        for result in raw_results:
-            sentiments.append(sentiment_map.get(result['label'], 'neutral'))
-        del classifier
-        gc.collect()
-        return sentiments
-    
-    def filter_response_safety_batch(self, texts: List[str]) -> List[str]:
-        """Filter responses for safety for each entry in the batch"""
-        classifier = hf_pipeline(
-            "text-classification",
-            model=self.safety_model_name,
-            device=self.device
-        )
-        truncated_texts = [text[:CONFIG['truncate_length']] for text in texts]
-        raw_results = classifier(truncated_texts)
-        toxicity_flags = []
-        for result in raw_results:
-            toxicity_flags.append("true" if result['score'] > 0.5 else "false")
-        del classifier
-        gc.collect()
-        return toxicity_flags
-
 
 # Global service
 llm_service = None
 
-@app.route('/process', methods=['POST'])
-def handle_process():
-    """Handle processing requests from Node 0"""
+@app.route('/generate', methods=['POST'])
+def generate():
+    """Handle LLM generation requests from Node 0"""
     try:
         data = request.json
-        queries = data.get('queries')
-        documents = data.get('documents')
-        request_ids = data.get('request_ids')
+        compressed_data = data.get('data')
+        is_compressed = data.get('compressed', False)
         
-        if not queries or not documents or not request_ids:
-            return jsonify({'error': 'Missing required fields'}), 400
+        # Decompress if needed
+        if is_compressed:
+            decompressed = decompress_data(compressed_data)
+            request_data = json.loads(decompressed.decode('utf-8'))
+        else:
+            request_data = json.loads(base64.b64decode(compressed_data.encode('utf-8')).decode('utf-8'))
         
-        print(f"\n[Node 2] Processing batch of {len(queries)} requests")
+        queries = request_data['queries']
+        documents_batch = request_data['documents_batch']
+        request_ids = request_data['request_ids']
         
-        # Step 1: Generate LLM responses
-        print(f"[Node 2] Generating LLM responses...")
-        responses_text = llm_service.generate_responses_batch(queries, documents)
+        print(f"[Node 2] Generating responses for {len(queries)} queries")
         
-        # Step 2: Sentiment analysis
-        print(f"[Node 2] Analyzing sentiment...")
-        sentiments = llm_service.analyze_sentiment_batch(responses_text)
+        # Generate LLM responses
+        responses = llm_service.generate_responses_batch(queries, documents_batch)
         
-        # Step 3: Safety filter
-        print(f"[Node 2] Applying safety filter...")
-        toxicity_flags = llm_service.filter_response_safety_batch(responses_text)
+        # Prepare response
+        response_data = {
+            'responses': responses,
+            'request_ids': request_ids
+        }
         
-        print(f"[Node 2] Processing complete for {len(queries)} requests")
+        # Compress response
+        json_data = json.dumps(response_data).encode('utf-8')
+        compressed_response = compress_data(json_data)
         
         return jsonify({
-            'responses': responses_text,
-            'sentiments': sentiments,
-            'is_toxic': toxicity_flags,
-            'request_ids': request_ids
+            'data': compressed_response,
+            'compressed': ENABLE_COMPRESSION
         }), 200
-        
+    
     except Exception as e:
-        print(f"[Node 2] Error processing request: {e}")
         import traceback
-        traceback.print_exc()
+        print(f"[Node 2] Error: {e}")
+        print(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
 
 @app.route('/health', methods=['GET'])
@@ -174,8 +155,8 @@ def health():
     """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
-        'node': 2,
-        'service': 'llm+sentiment+safety'
+        'service': 'llm-generation',
+        'node': 2
     }), 200
 
 def main():
@@ -183,15 +164,17 @@ def main():
     global llm_service
     
     print("="*60)
-    print("NODE 2 SERVICE: LLM + SENTIMENT + SAFETY")
+    print("NODE 2 SERVICE: LLM GENERATION")
     print("="*60)
-    print(f"Node 2 IP: {NODE_2_IP}")
-    print(f"CPU only: {ONLY_CPU}")
-    print("="*60)
+    print(f"\nNode 2 IP: {NODE_2_IP}")
+    print(f"\nOptimization Status:")
+    print(f"  GPU Acceleration: {'Enabled' if USE_GPU else 'Disabled'}")
+    print(f"  Compression: {'Enabled' if ENABLE_COMPRESSION else 'Disabled'}")
     
-    # Initialize LLM service
-    print("\nInitializing LLM service...")
+    # Initialize service
+    print("\nInitializing service...")
     llm_service = LLMService()
+    print("Service initialized!")
     
     # Start Flask server
     print(f"\nStarting Flask server on {NODE_2_IP}")
@@ -201,4 +184,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

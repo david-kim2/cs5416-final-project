@@ -1,0 +1,82 @@
+\section{Bottleneck Analysis and Service Division}
+
+To design an optimal distributed architecture, we first profiled the monolithic pipeline to identify computational bottlenecks. We instrumented the pipeline to measure the execution time of each stage and analyzed the results to inform our service division strategy.
+
+\subsection{Monolithic Pipeline Profiling}
+
+We executed the monolithic pipeline with a single request and measured the time spent in each stage. Table~\ref{tab:bottleneck_timing} presents the detailed timing breakdown.
+
+\begin{table}[h]
+\centering
+\caption{Stage-wise Timing Analysis of Monolithic Pipeline}
+\label{tab:bottleneck_timing}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Pipeline Stage} & \textbf{Time (s)} & \textbf{Percentage (\%)} \\
+\midrule
+LLM Generation & 18.49 & 55.7 \\
+FAISS Search & 10.47 & 31.5 \\
+Rerank & 2.08 & 6.3 \\
+Embeddings & 0.95 & 2.9 \\
+Sentiment Analysis & 0.65 & 2.0 \\
+Safety Filter & 0.50 & 1.5 \\
+Fetch Documents & 0.05 & 0.1 \\
+\midrule
+\textbf{Total} & \textbf{33.19} & \textbf{100.0} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Bottleneck Identification}
+
+The profiling results reveal two dominant bottlenecks:
+
+\begin{enumerate}
+    \item \textbf{LLM Generation (55.7\%)}: The language model inference stage consumes over half of the total processing time (18.49s), making it the primary computational bottleneck. This stage involves autoregressive text generation, which is inherently sequential and computationally intensive.
+    
+    \item \textbf{FAISS Search (31.5\%)}: The approximate nearest neighbor search operation accounts for nearly one-third of the total time (10.47s). This stage involves loading the FAISS index and performing similarity search over high-dimensional vectors.
+\end{enumerate}
+
+Together, these two stages account for 87.2\% of the total processing time. The remaining stages (Rerank, Embeddings, Sentiment, Safety, and Document Fetching) collectively represent only 12.8\% of the execution time.
+
+\subsection{Optimal Service Division}
+
+Based on the bottleneck analysis, we designed a three-node distributed architecture that isolates the major bottlenecks and balances computational load:
+
+\subsubsection{Node 0: Frontend and Lightweight Models}
+\textbf{Services:} Embeddings, Sentiment Analysis, Safety Filter
+
+\textbf{Total Time:} 2.10s (6.4\% of total)
+
+\textbf{Rationale:} These stages are computationally lightweight and can be efficiently executed on the frontend node. This design keeps the orchestrator node active while minimizing resource contention with the bottleneck stages.
+
+\subsubsection{Node 1: Retrieval and Reranking}
+\textbf{Services:} FAISS Search, Document Fetching, Reranking
+
+\textbf{Total Time:} 12.60s (38.0\% of total)
+
+\textbf{Rationale:} Grouping FAISS search with document retrieval and reranking creates a cohesive retrieval pipeline. This node handles all document-related operations, allowing for efficient data locality and reducing inter-node communication overhead.
+
+\subsubsection{Node 2: LLM Generation}
+\textbf{Services:} LLM Generation only
+
+\textbf{Total Time:} 18.49s (55.7\% of total)
+
+\textbf{Rationale:} Isolating the LLM on a dedicated node prevents resource contention with other stages. Since LLM generation is the dominant bottleneck, dedicating an entire node ensures that it has exclusive access to computational resources (CPU/GPU), enabling optimal performance and simplifying system-level tuning.
+
+\subsection{Architecture Benefits}
+
+This service division strategy provides several key advantages:
+
+\begin{itemize}
+    \item \textbf{Bottleneck Isolation:} The LLM bottleneck is completely isolated, preventing interference from other stages and allowing for independent optimization.
+    
+    \item \textbf{Load Balancing:} The computational load is distributed across nodes (6.4\%, 38.0\%, 55.7\%), with the heaviest stage on its own node.
+    
+    \item \textbf{Reduced Inter-node Communication:} Related operations (FAISS, document fetch, rerank) are co-located, minimizing network overhead.
+    
+    \item \textbf{Scalability:} Each node can be independently scaled based on its workload characteristics.
+\end{itemize}
+
+This architecture design directly addresses the identified bottlenecks and provides a foundation for efficient distributed inference.
+

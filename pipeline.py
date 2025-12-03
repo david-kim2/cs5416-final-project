@@ -107,39 +107,85 @@ class MonolithicPipeline:
         for request in requests:
             print(f"- {request.request_id}: {request.query[:50]}...")
         
+        # Timing dictionary to track bottlenecks
+        step_timings = {}
+        overall_start = time.time()
+        
         # Step 1: Generate embeddings
         print("\n[Step 1/7] Generating embeddings for batch...")
+        step_start = time.time()
         query_embeddings = self._generate_embeddings_batch(queries)
+        step_timings['1_embeddings'] = time.time() - step_start
+        print(f"  ⏱ Time: {step_timings['1_embeddings']:.2f}s")
 
         # Step 2: FAISS ANN search
         print("\n[Step 2/7] Performing FAISS ANN search for batch...")
+        step_start = time.time()
         doc_id_batches = self._faiss_search_batch(query_embeddings)
+        step_timings['2_faiss'] = time.time() - step_start
+        print(f"  ⏱ Time: {step_timings['2_faiss']:.2f}s")
 
         # Step 3: Fetch documents from disk
         print("\n[Step 3/7] Fetching documents for batch...")
+        step_start = time.time()
         documents_batch = self._fetch_documents_batch(doc_id_batches)
+        step_timings['3_fetch_docs'] = time.time() - step_start
+        print(f"  ⏱ Time: {step_timings['3_fetch_docs']:.2f}s")
 
         # Step 4: Rerank documents
         print("\n[Step 4/7] Reranking documents for batch...")
+        step_start = time.time()
         reranked_docs_batch = self._rerank_documents_batch(
             queries,
             documents_batch
         )
+        step_timings['4_rerank'] = time.time() - step_start
+        print(f"  ⏱ Time: {step_timings['4_rerank']:.2f}s")
 
         # Step 5: Generate LLM responses
         print("\n[Step 5/7] Generating LLM responses for batch...")
+        step_start = time.time()
         responses_text = self._generate_responses_batch(
             queries,
             reranked_docs_batch
         )
+        step_timings['5_llm'] = time.time() - step_start
+        print(f"  ⏱ Time: {step_timings['5_llm']:.2f}s")
 
         # Step 6: Sentiment analysis
         print("\n[Step 6/7] Analyzing sentiment for batch...")
+        step_start = time.time()
         sentiments = self._analyze_sentiment_batch(responses_text)
+        step_timings['6_sentiment'] = time.time() - step_start
+        print(f"  ⏱ Time: {step_timings['6_sentiment']:.2f}s")
 
         # Step 7: Safety filter on responses
         print("\n[Step 7/7] Applying safety filter to batch...")
+        step_start = time.time()
         toxicity_flags = self._filter_response_safety_batch(responses_text)
+        step_timings['7_safety'] = time.time() - step_start
+        print(f"  ⏱ Time: {step_timings['7_safety']:.2f}s")
+        
+        # Print timing summary
+        total_time = time.time() - overall_start
+        print("\n" + "="*60)
+        print("BOTTLENECK ANALYSIS - Step Timings:")
+        print("="*60)
+        sorted_steps = sorted(step_timings.items(), key=lambda x: x[1], reverse=True)
+        for step_name, step_time in sorted_steps:
+            percentage = (step_time / total_time) * 100
+            step_label = {
+                '1_embeddings': '1. Embeddings',
+                '2_faiss': '2. FAISS Search',
+                '3_fetch_docs': '3. Fetch Documents',
+                '4_rerank': '4. Rerank',
+                '5_llm': '5. LLM Generation',
+                '6_sentiment': '6. Sentiment',
+                '7_safety': '7. Safety'
+            }.get(step_name, step_name)
+            print(f"  {step_label:25s}: {step_time:7.2f}s ({percentage:5.1f}%)")
+        print(f"\n  {'Total Time':25s}: {total_time:7.2f}s (100.0%)")
+        print("="*60)
         
         responses = []
         for idx, request in enumerate(requests):
@@ -158,12 +204,21 @@ class MonolithicPipeline:
     
     def _generate_embeddings_batch(self, texts: List[str]) -> np.ndarray:
         """Step 2: Generate embeddings for a batch of queries"""
+        load_start = time.time()
         model = SentenceTransformer(self.embedding_model_name).to(self.device)
+        load_time = time.time() - load_start
+        if load_time > 0.1:
+            print(f"    [BOTTLENECK] Model loading took {load_time:.2f}s")
+        
+        encode_start = time.time()
         embeddings = model.encode(
             texts,
             normalize_embeddings=True,
             convert_to_numpy=True
         )
+        encode_time = time.time() - encode_start
+        print(f"    [Timing] Encoding: {encode_time:.2f}s")
+        
         del model
         gc.collect()
         return embeddings
@@ -174,9 +229,17 @@ class MonolithicPipeline:
             raise FileNotFoundError("FAISS index not found. Please create the index before running the pipeline.")
         
         print("Loading FAISS index")
+        load_start = time.time()
         index = faiss.read_index(CONFIG['faiss_index_path'])
+        load_time = time.time() - load_start
+        print(f"    [BOTTLENECK] FAISS index loading took {load_time:.2f}s")
+        
+        search_start = time.time()
         query_embeddings = query_embeddings.astype('float32')
         _, indices = index.search(query_embeddings, CONFIG['retrieval_k'])
+        search_time = time.time() - search_start
+        print(f"    [Timing] Search: {search_time:.2f}s")
+        
         del index
         gc.collect()
         return [row.tolist() for row in indices]
@@ -208,9 +271,13 @@ class MonolithicPipeline:
     
     def _rerank_documents_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[List[Dict]]:
         """Step 5: Rerank retrieved documents for each query in the batch"""
+        load_start = time.time()
         tokenizer = AutoTokenizer.from_pretrained(self.reranker_model_name)
         model = AutoModelForSequenceClassification.from_pretrained(self.reranker_model_name).to(self.device)
         model.eval()
+        load_time = time.time() - load_start
+        if load_time > 0.1:
+            print(f"    [BOTTLENECK] Reranker model loading took {load_time:.2f}s")
         reranked_batches = []
         for query, documents in zip(queries, documents_batch):
             if not documents:
@@ -235,11 +302,14 @@ class MonolithicPipeline:
     
     def _generate_responses_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[str]:
         """Step 6: Generate LLM responses for each query in the batch"""
+        load_start = time.time()
         model = AutoModelForCausalLM.from_pretrained(
             self.llm_model_name,
             dtype=torch.float16,
         ).to(self.device)
         tokenizer = AutoTokenizer.from_pretrained(self.llm_model_name)
+        load_time = time.time() - load_start
+        print(f"    [BOTTLENECK] LLM model loading took {load_time:.2f}s")
         responses = []
         for query, documents in zip(queries, documents_batch):
             context = "\n".join([f"- {doc['title']}: {doc['content'][:200]}" for doc in documents[:3]])
@@ -272,11 +342,15 @@ class MonolithicPipeline:
     
     def _analyze_sentiment_batch(self, texts: List[str]) -> List[str]:
         """Step 7: Analyze sentiment for each generated response"""
+        load_start = time.time()
         classifier = hf_pipeline(
             "sentiment-analysis",
             model=self.sentiment_model_name,
             device=self.device
         )
+        load_time = time.time() - load_start
+        if load_time > 0.1:
+            print(f"    [BOTTLENECK] Sentiment model loading took {load_time:.2f}s")
         truncated_texts = [text[:CONFIG['truncate_length']] for text in texts]
         raw_results = classifier(truncated_texts)
         sentiment_map = {
@@ -295,11 +369,15 @@ class MonolithicPipeline:
     
     def _filter_response_safety_batch(self, texts: List[str]) -> List[bool]:
         """Step 8: Filter responses for safety for each entry in the batch"""
+        load_start = time.time()
         classifier = hf_pipeline(
             "text-classification",
             model=self.safety_model_name,
             device=self.device
         )
+        load_time = time.time() - load_start
+        if load_time > 0.1:
+            print(f"    [BOTTLENECK] Safety model loading took {load_time:.2f}s")
         truncated_texts = [text[:CONFIG['truncate_length']] for text in texts]
         raw_results = classifier(truncated_texts)
         toxicity_flags = []
