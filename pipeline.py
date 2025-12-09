@@ -2,6 +2,7 @@ import os
 import gc
 import json
 import time
+import sys
 import numpy as np
 import torch
 import faiss
@@ -23,8 +24,14 @@ from flask import Flask, request, jsonify
 from queue import Queue, Empty
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from collections import Counter
 
 warnings.filterwarnings('ignore')
+
+# Ensure prints are flushed immediately
+def print_flush(*args, **kwargs):
+    print(*args, **kwargs)
+    sys.stdout.flush()
 
 # ==================================================================
 # MEMORY MONITORING UTILITIES
@@ -61,7 +68,7 @@ def update_peak_memory():
 TOTAL_NODES = int(os.environ.get('TOTAL_NODES', 3))
 NODE_NUMBER = int(os.environ.get('NODE_NUMBER', 0))
 NODE_0_IP = os.environ.get('NODE_0_IP', 'localhost:8000')
-NODE_1_IP = os.environ.get('NODE_1_IP', 'localhost:8001')
+NODE_1_IP = os.environ.get('NODE_1_IP', 'localhost:8004')
 NODE_2_IP = os.environ.get('NODE_2_IP', 'localhost:8002')
 FAISS_INDEX_PATH = os.environ.get('FAISS_INDEX_PATH', 'faiss_index.bin')
 DOCUMENTS_DIR = os.environ.get('DOCUMENTS_DIR', 'documents/')
@@ -74,8 +81,12 @@ CONFIG = {
     'max_tokens': 128,
     'retrieval_k': 10,
     'truncate_length': 512,
-    'batch_size': 8,
-    'batch_timeout': 2.0,
+    # Opportunistic batching parameters
+    'min_batch_size': int(os.environ.get('MIN_BATCH_SIZE', 1)),
+    'max_batch_size': int(os.environ.get('MAX_BATCH_SIZE', 16)),
+    'base_batch_size': int(os.environ.get('BASE_BATCH_SIZE', 4)),
+    'batch_timeout': float(os.environ.get('BATCH_TIMEOUT', 3.0)),
+    'max_batch_timeout': float(os.environ.get('MAX_BATCH_TIMEOUT', 10.0)),
 }
 
 @dataclass
@@ -327,40 +338,113 @@ class SafetyService:
 
 
 # ==================================================================
-# BATCHING
+# BATCHING - OPPORTUNISTIC BATCHING
 # ==================================================================
 
+def calculate_optimal_batch_size(queue_depth: int) -> int:
+    """Calculate optimal batch size based on queue depth (opportunistic batching)"""
+    min_size = CONFIG['min_batch_size']
+    max_size = CONFIG['max_batch_size']
+    base_size = CONFIG['base_batch_size']
+    
+    if queue_depth <= 2:
+        return min_size
+    elif queue_depth <= 5:
+        return base_size
+    elif queue_depth <= 10:
+        return min(base_size * 2, max_size)
+    elif queue_depth <= 20:
+        return min(base_size * 3, max_size)
+    else:
+        return max_size
+
+def calculate_adaptive_timeout(queue_depth: int) -> float:
+    """Calculate adaptive timeout based on queue depth"""
+    base_timeout = CONFIG['batch_timeout']
+    max_timeout = CONFIG['max_batch_timeout']
+    
+    if queue_depth <= 2:
+        return base_timeout
+    elif queue_depth <= 5:
+        return base_timeout * 1.5
+    elif queue_depth <= 10:
+        return min(base_timeout * 2, max_timeout)
+    else:
+        return max_timeout
+
 class BatchAccumulator:
-    def __init__(self, max_size: int, timeout: float):
-        self.max_size = max_size
-        self.timeout = timeout
+    def __init__(self):
         self.batch = []
         self.lock = threading.Lock()
         self.first_item_time = None
+        self.pending_queue = Queue()  # Track all pending requests
+        self.ready_event = threading.Event()  # Signal when batch is ready
     
-    def add(self, item) -> Optional[List]:
+    def add(self, item) -> None:
+        """Add item to batch accumulator"""
         with self.lock:
             if not self.batch:
                 self.first_item_time = time.time()
             self.batch.append(item)
+            self.pending_queue.put(item)
             
-            # Process if batch is full
-            if len(self.batch) >= self.max_size:
-                return self._extract()
-        return None
+            # Calculate optimal batch size based on current queue depth
+            queue_depth = self.pending_queue.qsize()
+            optimal_batch_size = calculate_optimal_batch_size(queue_depth)
+            
+            # Signal worker thread if batch reaches optimal size
+            if len(self.batch) >= optimal_batch_size:
+                self.ready_event.set()
     
     def check(self) -> Optional[List]:
+        """Check if batch should be processed based on timeout or if ready"""
         with self.lock:
-            if self.batch and self.first_item_time:
-                # Process if timeout reached since first item
-                if time.time() - self.first_item_time >= self.timeout:
-                    return self._extract()
+            if not self.batch:
+                return None
+                
+            if not self.first_item_time:
+                return None
+            
+            queue_depth = self.pending_queue.qsize()
+            optimal_batch_size = calculate_optimal_batch_size(queue_depth)
+            
+            # Process if batch has reached optimal size
+            if len(self.batch) >= optimal_batch_size:
+                return self._extract()
+            
+            # Otherwise, check if timeout reached since first item
+            adaptive_timeout = calculate_adaptive_timeout(queue_depth)
+            if time.time() - self.first_item_time >= adaptive_timeout:
+                return self._extract()
+        
         return None
     
+    def wait_for_batch(self, timeout=0.1) -> bool:
+        """Wait for batch ready signal"""
+        return self.ready_event.wait(timeout=timeout)
+    
+    def clear_ready_event(self):
+        """Clear the ready event"""
+        self.ready_event.clear()
+    
+    def get_queue_depth(self) -> int:
+        """Get current queue depth (all pending requests)"""
+        return self.pending_queue.qsize()
+    
     def _extract(self) -> List:
+        """Extract and return current batch"""
         batch = self.batch
         self.batch = []
         self.first_item_time = None
+        self.ready_event.clear()
+        
+        # Remove extracted items from pending queue
+        for _ in range(len(batch)):
+            try:
+                self.pending_queue.get_nowait()
+            except Empty:
+                break
+        
         return batch
 
 
@@ -383,14 +467,21 @@ def create_node0_app():
     # State
     results = {}
     results_lock = threading.Lock()
-    batch_acc = BatchAccumulator(CONFIG['batch_size'], CONFIG['batch_timeout'])
+    batch_acc = BatchAccumulator()
     
     def process_batches():
         print("[Node0] Batch worker started")
+        print(f"[Node0] Opportunistic batching enabled:")
+        print(f"  Min batch size: {CONFIG['min_batch_size']}")
+        print(f"  Max batch size: {CONFIG['max_batch_size']}")
+        print(f"  Base batch size: {CONFIG['base_batch_size']}")
+        print(f"  Batch timeout: {CONFIG['batch_timeout']}s (adaptive up to {CONFIG['max_batch_timeout']}s)")
         
         # Profiling data
         batch_count = 0
         total_requests = 0
+        batch_sizes = []  # Track actual batch sizes used
+        batch_timestamps = []  # Track when each batch was processed
         stage_times = {
             'embedding': [],
             'faiss_search': [],
@@ -402,9 +493,17 @@ def create_node0_app():
             'total_batch': []
         }
         
+        # File to save batch size data
+        batch_log_file = os.environ.get('BATCH_LOG_FILE', 'batch_sizes.jsonl')
+        print(f"[Node0] Batch sizes will be logged to: {batch_log_file}")
+        
         while True:
             try:
-                time.sleep(0.5)
+                # Wait for batch ready signal or check timeout periodically
+                batch_acc.wait_for_batch(timeout=0.1)
+                batch_acc.clear_ready_event()
+                
+                # Check for batch (either from signal or timeout)
                 batch = batch_acc.check()
                 if not batch:
                     continue
@@ -412,12 +511,33 @@ def create_node0_app():
                 batch_start = time.time()
                 batch_count += 1
                 batch_size = len(batch)
+                batch_sizes.append(batch_size)  # Record actual batch size
+                batch_timestamps.append(time.time())  # Record timestamp
                 total_requests += batch_size
+                
+                # Save batch size to file immediately (will update with memory/throughput after processing)
+                try:
+                    with open(batch_log_file, 'a') as f:
+                        log_entry = {
+                            'timestamp': batch_start,
+                            'batch_number': batch_count,
+                            'batch_size': batch_size,
+                            'queue_depth': queue_depth,
+                            'optimal_batch_size': optimal_batch_size,
+                            'total_requests_so_far': total_requests
+                        }
+                        f.write(json.dumps(log_entry) + '\n')
+                        f.flush()  # Ensure immediate write
+                except Exception as e:
+                    print(f"[Node0] Warning: Could not write to batch log: {e}")
+                queue_depth = batch_acc.get_queue_depth()
+                optimal_batch_size = calculate_optimal_batch_size(queue_depth)
                 
                 mem_before = get_memory_usage_mb()
                 
                 print(f"\n{'='*60}")
                 print(f"[Node0] Processing batch #{batch_count} ({batch_size} requests)")
+                print(f"[Node0] Queue depth: {queue_depth}, Optimal batch size: {optimal_batch_size}")
                 print(f"[Node0] Memory: {mem_before:.1f} MB")
                 print(f"{'='*60}")
                 
@@ -432,16 +552,22 @@ def create_node0_app():
                 
                 # Step 2-4: Call Node 1 (FAISS + Docs + Rerank)
                 print(f"[Node0] Step 2-4: Calling Node 1 for retrieval...")
+                print(f"[Node0] Node 1 URL: http://{NODE_1_IP}/retrieve_batch")
                 node1_start = time.time()
-                response = requests.post(
-                    f"http://{NODE_1_IP}/retrieve_batch",
-                    json={'embeddings': embeddings.tolist(), 'queries': queries},
-                    timeout=120
-                )
-                result = response.json()
-                documents_batch = result['documents_batch']
-                node1_timings = result['timings']
-                node1_total = time.time() - node1_start
+                try:
+                    response = requests.post(
+                        f"http://{NODE_1_IP}/retrieve_batch",
+                        json={'embeddings': embeddings.tolist(), 'queries': queries},
+                        timeout=120
+                    )
+                    response.raise_for_status()  # Raise exception for bad status codes
+                    result = response.json()
+                    documents_batch = result['documents_batch']
+                    node1_timings = result['timings']
+                    node1_total = time.time() - node1_start
+                except requests.exceptions.RequestException as e:
+                    print(f"[Node0] ERROR calling Node 1: {e}")
+                    raise
                 
                 stage_times['faiss_search'].append(node1_timings['faiss_search'])
                 stage_times['document_fetch'].append(node1_timings['document_fetch'])
@@ -454,16 +580,22 @@ def create_node0_app():
                 
                 # Step 5: Call Node 2 (LLM)
                 print(f"[Node0] Step 5/7: Calling Node 2 for generation...")
+                print(f"[Node0] Node 2 URL: http://{NODE_2_IP}/generate_batch")
                 node2_start = time.time()
-                response = requests.post(
-                    f"http://{NODE_2_IP}/generate_batch",
-                    json={'queries': queries, 'documents_batch': documents_batch},
-                    timeout=300
-                )
-                result = response.json()
-                responses = result['responses']
-                llm_time = result['timing']
-                node2_total = time.time() - node2_start
+                try:
+                    response = requests.post(
+                        f"http://{NODE_2_IP}/generate_batch",
+                        json={'queries': queries, 'documents_batch': documents_batch},
+                        timeout=300
+                    )
+                    response.raise_for_status()  # Raise exception for bad status codes
+                    result = response.json()
+                    responses = result['responses']
+                    llm_time = result['timing']
+                    node2_total = time.time() - node2_start
+                except requests.exceptions.RequestException as e:
+                    print(f"[Node0] ERROR calling Node 2: {e}")
+                    raise
                 
                 stage_times['llm_generation'].append(llm_time)
                 print(f"  ├─ LLM generation: {llm_time:.3f}s ({llm_time/batch_size:.3f}s per request)")
@@ -502,20 +634,69 @@ def create_node0_app():
                 mem_after = get_memory_usage_mb()
                 update_peak_memory()
                 
+                throughput_per_sec = batch_size / batch_total
+                throughput_per_min = throughput_per_sec * 60
+                
                 print(f"\n{'='*60}")
                 print(f"[Node0] ✓ Batch #{batch_count} complete")
+                print(f"  Batch size used: {batch_size} requests")
                 print(f"  Total time: {batch_total:.3f}s")
-                print(f"  Throughput: {batch_size/batch_total:.2f} req/s")
+                print(f"  Throughput: {throughput_per_sec:.2f} req/s ({throughput_per_min:.1f} req/min)")
                 print(f"  Avg latency: {batch_total/batch_size:.3f}s per request")
                 print(f"  Memory: {mem_after:.1f} MB (peak: {peak_memory_mb:.1f} MB)")
                 print(f"{'='*60}")
                 
+                # Update batch log with memory and throughput
+                try:
+                    # Read last line, update it, and write back
+                    with open(batch_log_file, 'r') as f:
+                        lines = f.readlines()
+                    if lines:
+                        last_entry = json.loads(lines[-1].strip())
+                        if last_entry.get('batch_number') == batch_count:
+                            last_entry['batch_time'] = batch_total
+                            last_entry['throughput_per_sec'] = throughput_per_sec
+                            last_entry['throughput_per_min'] = throughput_per_min
+                            last_entry['memory_mb'] = mem_after
+                            last_entry['peak_memory_mb'] = peak_memory_mb
+                            last_entry['avg_latency_per_request'] = batch_total / batch_size
+                            lines[-1] = json.dumps(last_entry) + '\n'
+                            with open(batch_log_file, 'w') as f:
+                                f.writelines(lines)
+                except Exception as e:
+                    print(f"[Node0] Warning: Could not update batch log with metrics: {e}")
+                
                 # Print cumulative statistics every 5 batches
                 if batch_count % 5 == 0:
+                    total_time = sum(stage_times['total_batch'])
+                    overall_throughput_per_sec = total_requests / total_time if total_time > 0 else 0
+                    overall_throughput_per_min = overall_throughput_per_sec * 60
+                    avg_batch_size = total_requests / batch_count if batch_count > 0 else 0
+                    
+                    # Calculate batch size statistics
+                    if batch_sizes:
+                        min_batch_size = min(batch_sizes)
+                        max_batch_size = max(batch_sizes)
+                        avg_actual_batch_size = np.mean(batch_sizes)
+                        # Count distribution
+                        batch_distribution = Counter(batch_sizes)
+                    else:
+                        min_batch_size = max_batch_size = avg_actual_batch_size = 0
+                        batch_distribution = {}
+                    
                     print(f"\n{'='*60}")
                     print(f"CUMULATIVE STATISTICS (after {batch_count} batches, {total_requests} requests)")
                     print(f"{'='*60}")
-                    print(f"Average Stage Times (per batch):")
+                    print(f"Batch Size Statistics:")
+                    print(f"  Min batch size used: {min_batch_size}")
+                    print(f"  Max batch size used: {max_batch_size}")
+                    print(f"  Average batch size: {avg_actual_batch_size:.1f} requests")
+                    if batch_distribution:
+                        print(f"  Batch size distribution: {dict(sorted(batch_distribution.items()))}")
+                    print(f"\nPerformance Metrics:")
+                    print(f"  Overall throughput: {overall_throughput_per_sec:.2f} req/s ({overall_throughput_per_min:.1f} req/min)")
+                    print(f"  Peak memory: {peak_memory_mb:.1f} MB")
+                    print(f"\nAverage Stage Times (per batch):")
                     print(f"  Embedding:        {np.mean(stage_times['embedding']):.3f}s")
                     print(f"  FAISS search:     {np.mean(stage_times['faiss_search']):.3f}s")
                     print(f"  Document fetch:   {np.mean(stage_times['document_fetch']):.3f}s")
@@ -525,7 +706,6 @@ def create_node0_app():
                     print(f"  Safety:           {np.mean(stage_times['safety']):.3f}s")
                     print(f"  Total batch:      {np.mean(stage_times['total_batch']):.3f}s")
                     print(f"\nAverage per-request times:")
-                    avg_batch_size = total_requests / batch_count
                     print(f"  Embedding:        {np.mean(stage_times['embedding'])/avg_batch_size:.3f}s")
                     print(f"  FAISS search:     {np.mean(stage_times['faiss_search'])/avg_batch_size:.3f}s")
                     print(f"  Document fetch:   {np.mean(stage_times['document_fetch'])/avg_batch_size:.3f}s")
@@ -533,8 +713,6 @@ def create_node0_app():
                     print(f"  LLM generation:   {np.mean(stage_times['llm_generation'])/avg_batch_size:.3f}s")
                     print(f"  Sentiment:        {np.mean(stage_times['sentiment'])/avg_batch_size:.3f}s")
                     print(f"  Safety:           {np.mean(stage_times['safety'])/avg_batch_size:.3f}s")
-                    print(f"\nOverall throughput: {total_requests/sum(stage_times['total_batch']):.2f} req/s")
-                    print(f"Peak memory: {peak_memory_mb:.1f} MB")
                     print(f"{'='*60}\n")
                 
             except Exception as e:
@@ -558,6 +736,7 @@ def create_node0_app():
             if not request_id or not query:
                 return jsonify({'error': 'Missing request_id or query'}), 400
             
+            # Add request to batch accumulator
             batch_acc.add({'request_id': request_id, 'query': query, 'timestamp': time.time()})
             
             # Wait for result
@@ -611,19 +790,24 @@ def create_node1_app():
     @app.route('/retrieve_batch', methods=['POST'])
     def retrieve_batch():
         try:
+            print(f"[Node1] Received request at /retrieve_batch")
             data = request.json
             embeddings = data['embeddings']
             queries = data['queries']
             
-            print(f"[Node1] Processing batch of {len(embeddings)}")
+            print(f"[Node1] Processing batch of {len(embeddings)} requests")
+            print(f"[Node1] Number of queries: {len(queries)}")
             documents_batch, timings = retrieval_svc.process_batch(embeddings, queries)
             
+            print(f"[Node1] Batch processing complete. Returning {len(documents_batch)} document batches")
             return jsonify({
                 'documents_batch': documents_batch,
                 'timings': timings
             }), 200
         except Exception as e:
             print(f"[Node1] Error: {e}")
+            import traceback
+            traceback.print_exc()
             return jsonify({'error': str(e)}), 500
     
     @app.route('/health', methods=['GET'])
@@ -712,7 +896,7 @@ def main():
         port = int(NODE_0_IP.split(':')[1]) if ':' in NODE_0_IP else 8000
     elif NODE_NUMBER == 1:
         app = create_node1_app()
-        port = int(NODE_1_IP.split(':')[1]) if ':' in NODE_1_IP else 8001
+        port = int(NODE_1_IP.split(':')[1]) if ':' in NODE_1_IP else 8004
     elif NODE_NUMBER == 2:
         app = create_node2_app()
         port = int(NODE_2_IP.split(':')[1]) if ':' in NODE_2_IP else 8002

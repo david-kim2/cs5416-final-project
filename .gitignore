@@ -3,3 +3,4 @@ documents/
 .venv/
 __pycache__/
 test.py
+batch_sizes*
